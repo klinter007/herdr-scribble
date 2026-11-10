@@ -40,7 +40,17 @@ python3 -m pip install pillow
 herdr-app check ~/.config/herdr-app/mods/scribble
 ```
 
-Herdr docks the tray on the right the first time it sees the folder.
+If the tray does not show on the right, add it to your layout. Ask your agent
+("add the scribble mod as a narrow column on the right of my layout"), or put this
+block last in the row that holds your panes, in your own layout file under
+`~/.config/herdr-app/layouts/`:
+
+```json
+{ "id": "scribble", "type": "block", "size": { "px": 110 }, "min": 80, "max": 400,
+  "content": { "mod": "scribble" } }
+```
+
+Under 120 px the tray shows a "+" box and thumbnails only; wider, it also shows file names.
 
 ## Requirements
 

@@ -55,7 +55,11 @@ export default class Viewer extends View {
       const file = `${INBOX()}/${this.box}.json`;
       await fs.mkdir(INBOX(), { recursive: true }).catch(() => {});
       const read = async () => { try { return JSON.parse(await readTextFile(file)); } catch { return null; } };
-      this.seen = (await read())?.id ?? null;   // an older request is not for this copy
+      // An older request is not for this copy. A request of the last seconds is: the Images
+      // button opened this tray for it.
+      const old = await read();
+      this.seen = old && Date.now() - Number(old.id) / 1e6 > 5000 ? old.id : null;
+      if (old && !this.seen) { this.seen = old.id; await fs.writeFile(`${INBOX()}/${this.box}.ack`, String(old.id)).catch(() => {}); this.add(old.files ?? [], cx, old.space ?? null); }
       for (;;) {
         await watchFolder(INBOX());
         const m = await read();
@@ -114,6 +118,16 @@ export default class Viewer extends View {
     const panels = shared("workspace.panels") ?? ["files", "changes"];
     if (!panels.includes("view")) setShared("workspace.panels", [...panels, "view"]);   // the tab bar restores it per space
     cx.spawn(async (cx) => { for (;;) { if ((await nextCommand()) === "toggle") this.toggle(); cx.notify(); } });
+    // A file sent with view.py opens the tray when it is closed.
+    cx.spawn(async (cx) => {
+      await fs.mkdir(INBOX(), { recursive: true }).catch(() => {});
+      for (;;) {
+        await watchFolder(INBOX());
+        let m = null;
+        try { m = JSON.parse(await readTextFile(`${INBOX()}/dock.json`)); } catch { continue; }
+        if (m?.id && m.id !== this.asked && Date.now() - Number(m.id) / 1e6 < 5000) { this.asked = m.id; if (!this.shown()) this.toggle(); }
+      }
+    });
   }
 
   shown() {

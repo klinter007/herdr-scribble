@@ -45,6 +45,7 @@ A person drops an image into a narrow tray at the right of the Herdr window. A l
 
 **Watch out:**
 
+- Herdr may not dock the tray by itself from `mod.json`; then add a block `{ "id": "scribble", "type": "block", "size": { "px": 110 }, "content": { "mod": "scribble" } }` to the row of the person's own layout that holds the panes.
 - macOS only as built (clipboard and open commands). `python3` on the PATH must have Pillow; without it every add fails with a toast.
 - The paste after Insert runs from a detached `sh -c 'sleep 0.15; herdr-app do pane.focus …; sleep 0.15; herdr-app do terminal.paste'`, because the dialog's own tasks stop when it closes.
 - The target terminal is read when the editor opens (`focused().terminal`, else the shown tab's first agent pane). With no terminal, Insert shows an error toast and does nothing.

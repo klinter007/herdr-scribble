@@ -195,8 +195,6 @@ def show(paths, terminal=None):
         app('tab.new', args)
     files = [f for f in files if kind(f) == 'image']
     if not files: return {'shown': pages, 'pane': 'tab'}
-    for command, args in (('layout.select', {'stack': 'panel-body', 'child': 'view'}), ('layout.show', {'id': 'panel'})):
-        subprocess.run(['herdr-app', 'do', command, json.dumps(args)], capture_output=True, timeout=15)
     if offer('dock', files, 15, space): return {'shown': files, 'pane': 'dock'}
     if tab and offer(tab, files, 8): return {'shown': files, 'pane': 'existing'}
     args = {'direction': 'right', 'mod': 'scribble', 'props': {'files': files, 'tab': tab}}
