@@ -115,9 +115,21 @@ export default class Viewer extends View {
 
   initButton(cx) {
     this.button = true;
+    // The panels this bar opens: Images (the tray), and any others the layout names in
+    // props.buttons [{ child, label, icon, width }], each a child of the `panel-body` stack.
+    this.bar = props()?.buttons ?? [{ child: "view", label: "Images", icon: props()?.icon ?? "mods/scribble/image.svg", width: 184 }];
     const panels = shared("workspace.panels") ?? ["files", "changes"];
-    if (!panels.includes("view")) setShared("workspace.panels", [...panels, "view"]);   // the tab bar restores it per space
-    cx.spawn(async (cx) => { for (;;) { if ((await nextCommand()) === "toggle") this.toggle(); cx.notify(); } });
+    const more = this.bar.map((b) => b.child).filter((c) => !panels.includes(c));
+    if (more.length) setShared("workspace.panels", [...panels, ...more]);   // the tab bar restores them per space
+    // Key commands: scribble.toggle (Images), scribble.toggle-<child>.
+    cx.spawn(async (cx) => {
+      for (;;) {
+        const c = await nextCommand();
+        if (c === "toggle") this.toggle("view");
+        else if (typeof c === "string" && c.startsWith("toggle-")) this.toggle(c.slice(7));
+        cx.notify();
+      }
+    });
     // A file sent with view.py opens the tray when it is closed.
     cx.spawn(async (cx) => {
       await fs.mkdir(INBOX(), { recursive: true }).catch(() => {});
@@ -125,48 +137,49 @@ export default class Viewer extends View {
         await watchFolder(INBOX());
         let m = null;
         try { m = JSON.parse(await readTextFile(`${INBOX()}/dock.json`)); } catch { continue; }
-        if (m?.id && m.id !== this.asked && Date.now() - Number(m.id) / 1e6 < 5000) { this.asked = m.id; if (!this.shown()) this.toggle(); }
+        if (m?.id && m.id !== this.asked && Date.now() - Number(m.id) / 1e6 < 5000) { this.asked = m.id; if (this.active() !== "view") this.toggle("view"); }
       }
     });
   }
 
-  shown() {
+  // The panel child that shows now, or null when the panel is closed.
+  active() {
     const find = (n, id) => (!n ? null : n.id === id ? n : (n.children ?? []).map((c) => find(c, id)).find(Boolean) ?? null);
     const root = layout(), panel = find(root, "panel"), body = find(root, "panel-body");
     this.sync(panel, body?.active);
-    return Boolean(panel && !panel.hidden && body?.active === "view");
+    return panel && !panel.hidden ? body?.active ?? null : null;
   }
 
-  // The panel is half as wide for Images as for Files and Changes. On a change between them, the
-  // width the person left for each side is kept and the other side's width is set.
+  // Each of this bar's panels has its own width; Files and Changes share one. On a change
+  // between them, the width the person left is kept and the other side's width is set.
   sync(panel, active) {
-    const side = panel && !panel.hidden ? (active === "view" ? "view" : "files") : null;
-    if (!side) return;
-    const px = panel.size?.px;
+    if (!panel || panel.hidden) return;
+    const mine = this.bar.find((b) => b.child === active);
+    const side = mine ? mine.child : "files", usual = mine?.width ?? 368;
+    const px = panel.size?.px, kept = Number(localStorage.getItem(`width-${side}`));
     if (this.side && this.side !== side) {
       if (px) localStorage.setItem(`width-${this.side}`, String(px));
-      const want = Number(localStorage.getItem(`width-${side}`)) || (side === "view" ? 184 : 368);
-      if (want !== px) run("layout.resize", { id: "panel", px: want });
-    } else if (!this.side && side === "view" && !localStorage.getItem("width-view") && px !== 184) {
-      run("layout.resize", { id: "panel", px: 184 });
+      if ((kept || usual) !== px) run("layout.resize", { id: "panel", px: kept || usual });
+    } else if (!this.side && mine && !kept && px !== usual) {
+      run("layout.resize", { id: "panel", px: usual });
     }
     this.side = side;
   }
 
-  toggle() {
-    if (this.shown()) run("layout.hide", { id: "panel" });
-    else { run("layout.select", { stack: "panel-body", child: "view" }); run("layout.show", { id: "panel" }); }
+  toggle(child) {
+    if (this.active() === child) run("layout.hide", { id: "panel" });
+    else { run("layout.select", { stack: "panel-body", child }); run("layout.show", { id: "panel" }); }
   }
 
   bar_button(t) {
-    const on = this.shown();
-    return h_flex().size_full().pr(10).items_center().bg(t.chrome).border_b(1).border_color(t.border)
-      .child(h_flex().id("panel-view").h(26).px(8).gap(5).flex_none().items_center().rounded(6).cursor_pointer()
-        .text_size(12).bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted)
+    const now = this.active();
+    return h_flex().size_full().pr(10).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
+      .children(this.bar.map((b) => h_flex().id(`panel-${b.child}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6).cursor_pointer()
+        .text_size(12).bg(now === b.child ? t.selected : t.chrome).text_color(now === b.child ? t.foreground : t.muted)
         .hover((s) => s.bg(t.hover))
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-        .on_click(() => this.toggle())
-        .child(svg(props()?.icon ?? "mods/scribble/image.svg").size(14)).child("Images"));
+        .on_click(() => this.toggle(b.child))
+        .child(svg(b.icon ?? "mods/scribble/image.svg").size(14)).child(b.label)));
   }
 
   paste(cx) {
