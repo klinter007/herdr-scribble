@@ -1,9 +1,11 @@
 // View: images and markdown inside Herdr, in two parts.
 // The tray (the layout's `view` block, props { dock: true }): a small drop area with the items under
-// it. Drop files on it, or click it and press Cmd+V. A new item, or a click on one, opens the editor.
-// The editor (a dialog, props { editor: true, item, terminal, folder }): an image to draw on (pen,
-// box, arrow, text label) or a markdown file to read. Insert to chat saves the marked image in the
-// project (<folder>/.scribble), closes the dialog and pastes the image into the chat.
+// it. Drop files on it, or click it and press Cmd+V: the image opens in the editor. An image an
+// agent sends (view.py) does not open and takes no focus: it waits in the tray of that agent's
+// space with a mark, and the Images button shows a dot, until the person opens it.
+// The editor (a tab of its own, props { editor: true, item, terminal, folder }): an image to draw
+// on (pen, box, arrow, text label). Insert to chat saves the marked image in the project
+// (<folder>/.scribble), closes the tab and pastes the image into the chat it was opened from.
 // Each space has its own items (kept in this copy's localStorage). The tray is a child of the
 // layout's `panel-body` stack, beside Files and Changes; the Images button in the tab bar
 // (props { button: true }) and the key command `scribble.toggle` open and close it.
@@ -18,6 +20,7 @@ import * as fs from "fs/promises";
 const PY = "python3";   // needs Pillow: python3 -m pip install pillow
 const SCRIPT = () => `${appHome()}/mods/scribble/view.py`;
 const INBOX = () => `${appHome()}/data/scribble/inbox`;
+const QUEUE = () => `${INBOX()}/queue.jsonl`;
 const MARKS = "scribble.marks";
 const COLORS = ["#ff3b30", "#ffcc00", "#34c759", "#0a84ff", "#ffffff", "#000000"];
 const TOOLS = [["pen", "Pen"], ["box", "Box"], ["arrow", "Arrow"], ["text", "Text"]];
@@ -47,27 +50,30 @@ export default class Viewer extends View {
       return;
     }
     try { this.by = JSON.parse(localStorage.getItem("items") ?? "{}"); } catch { this.by = {}; }
-    this.box = props()?.tab || "dock";
     const first = props()?.files ?? [];
     if (first.length) this.add(first, cx, null);
-    cx.spawn(async (cx) => {
-      if (!this.box) return;
-      const file = `${INBOX()}/${this.box}.json`;
+    // What agents send (view.py) waits in a queue file. This tray takes what is newer than what
+    // it took last, also what came while it was closed; nothing opens and nothing moves.
+    // Only the tray takes from the queue; a pane opened for some files (an older view.py) does not.
+    this.isTray = !props()?.files && !props()?.tab;
+    if (this.isTray) cx.spawn(async (cx) => {
       await fs.mkdir(INBOX(), { recursive: true }).catch(() => {});
-      const read = async () => { try { return JSON.parse(await readTextFile(file)); } catch { return null; } };
-      // An older request is not for this copy. A request of the last seconds is: the Images
-      // button opened this tray for it.
-      const old = await read();
-      this.seen = old && Date.now() - Number(old.id) / 1e6 > 5000 ? old.id : null;
-      if (old && !this.seen) { this.seen = old.id; await fs.writeFile(`${INBOX()}/${this.box}.ack`, String(old.id)).catch(() => {}); this.add(old.files ?? [], cx, old.space ?? null); }
-      for (;;) {
-        await watchFolder(INBOX());
-        const m = await read();
-        if (!m || m.id === this.seen) continue;
-        this.seen = m.id;
-        await fs.writeFile(`${INBOX()}/${this.box}.ack`, String(m.id)).catch(() => {});
-        this.add(m.files ?? [], cx, m.space ?? null);
-      }
+      this.taken = BigInt(localStorage.getItem("taken") ?? "0");
+      const drain = async () => {
+        const text = await readTextFile(QUEUE()).catch(() => "");
+        for (const line of text.split("\n")) {
+          let m = null;
+          try { m = JSON.parse(line); } catch { continue; }
+          if (!m?.id || BigInt(m.id) <= this.taken) continue;
+          this.taken = BigInt(m.id);
+          this.add(m.files ?? [], cx, m.space ?? null, true);
+        }
+        localStorage.setItem("taken", String(this.taken));
+        if (Object.keys(shared("scribble.pending") ?? {}).length) setShared("scribble.pending", {});
+        if (shared("scribble.taken") !== String(this.taken)) setShared("scribble.taken", String(this.taken));
+      };
+      await drain();
+      for (;;) { await watchFolder(INBOX()); await drain().catch(() => {}); }
     });
   }
 
@@ -83,7 +89,15 @@ export default class Viewer extends View {
   }
 
   // New items go to a space's list (default: the shown space). The last one opens when that space shows.
-  take(found, space) {
+  // How many images wait unopened in each space, for the Images button's dot.
+  countFresh() {
+    if (!this.isTray) return;
+    const n = Object.fromEntries(Object.entries(this.by).map(([k, list]) => [k, list.filter((x) => x.fresh).length]).filter(([, c]) => c > 0));
+    if (JSON.stringify(n) !== JSON.stringify(shared("scribble.fresh") ?? {})) setShared("scribble.fresh", n);
+  }
+
+  // `sent`: an agent sent these; they wait in the tray and nothing opens.
+  take(found, space, sent = false) {
     const key = space || this.space(), list = (this.by[key] ??= []);
     let last = null;
     for (const it of found) {
@@ -92,21 +106,23 @@ export default class Viewer extends View {
       if (it.kind === "md") { run("tab.new", { space: key === "none" ? undefined : key, name: it.name, mod: "scribble", props: { page: it.path } }); continue; }
       const at = list.findIndex((x) => x.path === it.path);
       if (at >= 0) list.splice(at, 1);
-      list.unshift(it);
+      list.unshift(sent ? { ...it, fresh: true } : it);
       last = it;
     }
     list.length = Math.min(list.length, 30);
     this.save();
+    this.countFresh();
     if (!last) return;
-    if (key === this.space()) this.open(last);
+    if (sent) notify({ title: `An image waits in Images${key === this.space() ? "" : ` (${spaces().find((s) => s.id === key)?.name ?? "another space"})`}`, body: last.name, timeout: 5000 });
+    else if (key === this.space()) this.open(last);
     else notify({ title: `Added to ${spaces().find((s) => s.id === key)?.name ?? "another space"}`, body: last.name });
   }
 
-  add(paths, cx, space) {
+  add(paths, cx, space, sent = false) {
     if (!paths?.length) return;
     const key = space || this.space();
     cx.spawn(async (cx) => {
-      try { this.take(await script(["add", ...paths]), key); } catch (e) { fail("Can't open the files", e); }
+      try { this.take(await script(["add", ...paths]), key, sent); } catch (e) { fail("Can't open the files", e); }
       cx.notify();
     });
   }
@@ -130,15 +146,18 @@ export default class Viewer extends View {
         cx.notify();
       }
     });
-    // A file sent with view.py opens the tray when it is closed.
+    // Images that agents sent while the tray was never opened: counted here, for the button's dot.
     cx.spawn(async (cx) => {
       await fs.mkdir(INBOX(), { recursive: true }).catch(() => {});
-      for (;;) {
-        await watchFolder(INBOX());
-        let m = null;
-        try { m = JSON.parse(await readTextFile(`${INBOX()}/dock.json`)); } catch { continue; }
-        if (m?.id && m.id !== this.asked && Date.now() - Number(m.id) / 1e6 < 5000) { this.asked = m.id; if (this.active() !== "view") this.toggle("view"); }
-      }
+      const count = async () => {
+        const text = await readTextFile(QUEUE()).catch(() => ""), taken = BigInt(shared("scribble.taken") ?? "0"), n = {};
+        for (const line of text.split("\n")) {
+          try { const m = JSON.parse(line); if (m?.id && BigInt(m.id) > taken && m.space) n[m.space] = (n[m.space] ?? 0) + 1; } catch { /* not a line */ }
+        }
+        if (JSON.stringify(n) !== JSON.stringify(shared("scribble.pending") ?? {})) setShared("scribble.pending", n);
+      };
+      await count();
+      for (;;) { await watchFolder(INBOX()); await count(); cx.notify(); }
     });
   }
 
@@ -171,6 +190,12 @@ export default class Viewer extends View {
     else { run("layout.select", { stack: "panel-body", child }); run("layout.show", { id: "panel" }); }
   }
 
+  // Images that wait unopened in the shown space: in the tray, or not taken by it yet.
+  waiting() {
+    const id = spaces().find((s) => s.active)?.id;
+    return ((shared("scribble.fresh") ?? {})[id] ?? 0) + ((shared("scribble.pending") ?? {})[id] ?? 0);
+  }
+
   bar_button(t) {
     const now = this.active();
     return h_flex().size_full().pr(10).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
@@ -179,7 +204,9 @@ export default class Viewer extends View {
         .hover((s) => s.bg(t.hover))
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
         .on_click(() => this.toggle(b.child))
-        .child(svg(b.icon ?? "mods/scribble/image.svg").size(14)).child(b.label)));
+        .child(svg(b.icon ?? "mods/scribble/image.svg").size(14)).child(b.label)
+        // an image waits unopened in this space
+        .when(b.child === "view" && this.waiting() > 0, (el) => el.child(div().size(6).flex_none().rounded_full().bg(t.accent)))));
   }
 
   paste(cx) {
@@ -198,15 +225,19 @@ export default class Viewer extends View {
     return (here.find((p) => p.status) ?? here[0])?.terminal ?? null;
   }
 
+  // The editor, as a tab of the shown space: it waits there like any tab and covers nothing.
   open(it) {
     const space = spaces().find((s) => s.active);
-    openOverlay({ mod: "scribble", kind: "dialog", modal: true, width: 0.92, height: 0.92,
-      props: { editor: true, item: it, terminal: this.target(), folder: space && !space.machine ? space.folder : null } });
+    if (it.fresh) { delete it.fresh; this.save(); this.countFresh(); }
+    const { fresh: _f, ...item } = it;
+    run("tab.new", { space: space?.id, name: it.name, mod: "scribble",
+      props: { editor: true, item, terminal: this.target(), folder: space && !space.machine ? space.folder : null } });
   }
 
   remove(n) {
     const [it] = this.items.splice(n, 1);
     this.save();
+    this.countFresh();
     const marks = { ...(shared(MARKS) ?? {}) };
     if (it && marks[it.path]) { delete marks[it.path]; setShared(MARKS, marks); }
   }
@@ -232,8 +263,8 @@ export default class Viewer extends View {
       .child(v_flex().id("items").flex_1().min_h(0).gap(4).items_center().overflow_hidden().children(this.items.map((it, n) =>
         div().id(`item-${n}`).size(side).flex_none().rounded(4).overflow_hidden().cursor_pointer().bg(t.raised)
           .flex().items_center().justify_center().text_size(10).text_color(t.muted)
-          .border(1).border_color(t.border).hover((s) => s.border_color(t.accent))
-          .on_click(() => this.open(it))
+          .border(it.fresh ? 2 : 1).border_color(it.fresh ? t.accent : t.border).hover((s) => s.border_color(t.accent))
+          .on_click((_e, cx) => { this.open(it); cx.notify(); })
           .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.remove(n); cx.notify(); })
           .child(it.kind === "image" ? image(it.rel).size_full() : "MD"))));
   }
@@ -259,8 +290,10 @@ export default class Viewer extends View {
       .child(v_flex().id("items").flex_1().min_h(0).gap(4).overflow_y_scrollbar().children(this.items.map((it, n) =>
         h_flex().id(`item-${n}`).h(76).flex_none().px(6).gap(8).items_center().rounded(6).cursor_pointer()
           .hover((s) => s.bg(t.surface))
-          .on_click(() => this.open(it))
+          .on_click((_e, cx) => { this.open(it); cx.notify(); })
+          .when(Boolean(it.fresh), (el) => el.child(div().size(7).flex_none().rounded_full().bg(t.accent)))
           .child(div().size(64).flex_none().rounded(4).overflow_hidden().bg(t.raised).flex().items_center().justify_center()
+            .when(Boolean(it.fresh), (el) => el.border(2).border_color(t.accent))
             .text_size(10).text_color(t.muted)
             .child(it.kind === "image" ? image(it.rel).size_full() : "MD"))
           .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(it.name))
@@ -291,7 +324,8 @@ export default class Viewer extends View {
   }
 
   keep() { setShared(MARKS, { ...(shared(MARKS) ?? {}), [this.it.path]: this.shapes }); }
-  shut() { closeOverlay(props()?.overlay); }
+  // The editor is a tab (an older caller may still open it as a dialog).
+  shut() { props()?.overlay ? closeOverlay(props().overlay) : run("tab.close"); }
 
   flatten(mode) {
     return script(["flatten", JSON.stringify({ path: this.it.path, shapes: this.shapes, mode, dir: props()?.folder, line: LINE, text: TEXT })]);

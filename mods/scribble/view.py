@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Helper for the scribble Herdr mod, and the `herdr-view` command.
 
-  herdr-view <file>...        show images / markdown in a View pane beside this terminal
+  herdr-view <file>...        an image waits in the Images tray of this terminal's space; markdown opens as a tab
   view.py add <path>...       make dropped files showable; prints JSON
   view.py paste               the clipboard's image as an item; prints JSON
   view.py flatten <json>      draw the marks on the image, copy it; prints JSON
@@ -168,39 +168,29 @@ def where(terminal):
     return None, None, None
 
 
-def offer(box, files, tries, space=None):
-    """Leave files in an inbox; true when a live View took them."""
+def queue(files, space):
+    """Leave images for the tray. It takes them when it is alive, or the next time it opens; nothing opens by itself."""
     INBOX.mkdir(parents=True, exist_ok=True)
-    ident = f'{time.time_ns()}'
-    ack = INBOX / f'{box}.ack'
-    (INBOX / f'{box}.json').write_text(json.dumps({'id': ident, 'files': files, 'space': space}))
-    for _ in range(tries):
-        time.sleep(0.1)
-        if ack.exists() and ack.read_text().strip() == ident: return True
-    return False
+    q = INBOX / 'queue.jsonl'
+    old = q.read_text().splitlines()[-49:] if q.exists() else []
+    q.write_text('\n'.join(old + [json.dumps({'id': f'{time.time_ns()}', 'files': files, 'space': space})]) + '\n')
 
 
 def show(paths, terminal=None):
-    """Show files in the View pane of the caller's tab; split one beside the caller when there is none."""
+    """Markdown opens as a tab in the caller's space. Images go to the tray of the caller's space and wait there."""
     files = [str(Path(os.path.expanduser(p)).resolve()) for p in paths]
     for f in files:
         if not os.path.isfile(f): raise SystemExit(f'No such file: {f}')
         if not kind(f): raise SystemExit(f'herdr-view shows images and markdown/text. Use `open` for: {f}')
-    # The layout's View block first (shown if hidden), then a View pane of the caller's tab.
-    space, tab, pane = where(terminal or os.environ.get('HC_TERMINAL_ID'))
+    space, _tab, _pane = where(terminal or os.environ.get('HC_TERMINAL_ID'))
     pages = [f for f in files if kind(f) == 'md']
-    for f in pages:  # markdown: a tab of its own in the caller's space
+    for f in pages:
         args = {'name': Path(f).name, 'mod': 'scribble', 'props': {'page': f}}
         if space: args['space'] = space
         app('tab.new', args)
-    files = [f for f in files if kind(f) == 'image']
-    if not files: return {'shown': pages, 'pane': 'tab'}
-    if offer('dock', files, 15, space): return {'shown': files, 'pane': 'dock'}
-    if tab and offer(tab, files, 8): return {'shown': files, 'pane': 'existing'}
-    args = {'direction': 'right', 'mod': 'scribble', 'props': {'files': files, 'tab': tab}}
-    if pane: args['pane'] = pane
-    app('pane.split', args)
-    return {'shown': files, 'pane': 'new'}
+    images = [f for f in files if kind(f) == 'image']
+    if images: queue(images, space)
+    return {'shown': pages, 'waiting_in_tray': images}
 
 
 def main(argv):
