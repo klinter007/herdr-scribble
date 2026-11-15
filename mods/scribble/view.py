@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Helper for the scribble Herdr mod, and the `herdr-view` command.
 
-  herdr-view <file>...        an image waits in the Images tray of this terminal's space; markdown opens as a tab
+  herdr-view <file>...        the file goes on the list of the Preview tab of this terminal's space
   view.py add <path>...       make dropped files showable; prints JSON
   view.py paste               the clipboard's image as an item; prints JSON
   view.py flatten <json>      draw the marks on the image, copy it; prints JSON
@@ -193,21 +193,69 @@ def queue(files, space):
     q.write_text('\n'.join(old + [json.dumps({'id': f'{time.time_ns()}', 'files': files, 'space': space})]) + '\n')
 
 
-def show(paths, terminal=None):
-    """Markdown opens as a tab in the caller's space. Images go to the tray of the caller's space and wait there."""
+PREVIEWS = DATA / 'previews'
+
+
+def source_of(terminal):
+    """Who sent a file: the terminal, and a name a person reads (its own name, else tab and program)."""
+    try: g = json.loads(subprocess.run(['herdr-core', 'get', terminal, '--json'], capture_output=True, text=True, timeout=15).stdout)
+    except Exception: g = {}
+    where = str((g.get('labels') or {}).get('where') or '')
+    tab = where.split(' / ')[-1].strip() if ' / ' in where else ''
+    program = str(((g.get('foreground') or {}).get('argv') or [''])[0]).split('/')[-1]
+    name = g.get('name') or (tab if tab and not tab.isdigit() else ' '.join(x for x in (program, tab) if x)) or terminal or 'unknown'
+    return {'terminal': terminal, 'name': name}
+
+
+def preview_tab(space):
+    """The one Preview tab of a space: made the first time, in the background, then reused."""
+    PREVIEWS.mkdir(parents=True, exist_ok=True)
+    note = PREVIEWS / f'{space}.tab'
+    known = note.read_text().strip() if note.exists() else ''
+    try: listing = json.loads(subprocess.run(['herdr-app', 'ls'], capture_output=True, text=True, timeout=15).stdout).get('spaces', [])
+    except Exception: listing = []
+    mine = next((sp for sp in listing if sp['id'] == space), None)
+    if not mine: return None
+    if known and any(t['id'] == known for t in mine['tabs']): return known
+    try: before = json.loads(subprocess.run(['herdr-app', 'status'], capture_output=True, text=True, timeout=15).stdout)
+    except Exception: before = {}
+    front = next((t['id'] for t in mine['tabs'] if t.get('active')), None)
+    made = app('tab.new', {'space': space, 'name': 'Preview', 'mod': 'scribble', 'props': {'previews': True, 'space': space}}).get('tab')
+    if made: note.write_text(made)
+    # the space keeps the tab it showed, and the person keeps the pane they were in
+    if front: subprocess.run(['herdr-app', 'do', 'tab.select', json.dumps({'id': front})], capture_output=True, timeout=15)
+    if before.get('focused_pane'): subprocess.run(['herdr-app', 'do', 'pane.focus', json.dumps({'pane': before['focused_pane']})], capture_output=True, timeout=15)
+    return made
+
+
+def show(paths, terminal=None, record_only=False):
+    """An agent shows files: each one goes on the list of its space's Preview tab, newest first.
+    Nothing comes to the front: the tab's name says how many are new. `record_only`: the file was
+    opened elsewhere (a browser); it is listed, and the tab is not made for it alone."""
     files = [str(Path(os.path.expanduser(p)).resolve()) for p in paths]
     for f in files:
         if not os.path.isfile(f): raise SystemExit(f'No such file: {f}')
-        if not kind(f): raise SystemExit(f'herdr-view shows images and markdown/text. Use `open` for: {f}')
-    space = space_of(terminal or os.environ.get('HC_TERMINAL_ID'))
-    pages = [f for f in files if kind(f) == 'md']
-    for f in pages:
-        # in the caller's own space; with no space found, in the background and never in the space in focus
-        if space: app('tab.new', {'name': Path(f).name, 'mod': 'scribble', 'props': {'page': f}, 'space': space})
-        else: subprocess.run(['/usr/bin/open', '-g', f], timeout=15)
-    images = [f for f in files if kind(f) == 'image']
-    if images: queue(images, space)
-    return {'shown': pages, 'waiting_in_tray': images}
+    terminal = terminal or os.environ.get('HC_TERMINAL_ID')
+    space = space_of(terminal)
+    if not space:   # nothing says which space: in the background, never in the space in focus
+        for f in files: subprocess.run(['/usr/bin/open', '-g', f], timeout=15)
+        return {'shown': [], 'opened_outside': files}
+    PREVIEWS.mkdir(parents=True, exist_ok=True)
+    listing = PREVIEWS / f'{space}.jsonl'
+    old = [l for l in (listing.read_text().splitlines() if listing.exists() else []) if l.strip()]
+    who, now = source_of(terminal), int(time.time() * 1000)
+    new = [json.dumps({'id': f'{time.time_ns() + n}', 'path': f, 'kind': kind(f) or 'file', 'from': who, 't': now}) for n, f in enumerate(files)]
+    listing.write_text('\n'.join((old + new)[-300:]) + '\n')
+    tab = None if record_only else preview_tab(space)
+    if not tab:
+        note = PREVIEWS / f'{space}.tab'
+        tab = note.read_text().strip() if note.exists() else None
+    if tab:   # the tab says how many the person has not seen
+        seen = PREVIEWS / f'{space}.seen'
+        last = int(seen.read_text().strip() or 0) if seen.exists() else 0
+        fresh = sum(1 for l in old + new if int(json.loads(l)['id']) > last)
+        subprocess.run(['herdr-app', 'do', 'tab.rename', json.dumps({'id': tab, 'name': f'Preview · {fresh} new' if fresh else 'Preview'})], capture_output=True, timeout=15)
+    return {'listed_in_preview': files, 'space': space}
 
 
 def main(argv):
@@ -218,9 +266,11 @@ def main(argv):
     elif cmd == 'paste': out = paste()
     elif cmd == 'flatten': out = flatten(json.loads(rest[0]))
     elif cmd == 'show':
-        terminal = None
-        if rest[:1] == ['--terminal']: terminal, rest = rest[1], rest[2:]
-        out = show(rest, terminal)
+        terminal, record = None, False
+        while rest[:1] and rest[0] in ('--terminal', '--record-only'):
+            if rest[0] == '--terminal': terminal, rest = rest[1], rest[2:]
+            else: record, rest = True, rest[1:]
+        out = show(rest, terminal, record)
     else: out = show(argv)
     print(json.dumps(out))
 

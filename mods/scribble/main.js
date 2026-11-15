@@ -43,6 +43,7 @@ export default class Viewer extends View {
     this.handle = cx.focus_handle();
     if (this.editor) return this.initEditor(cx);
     if (props()?.button) return this.initButton(cx);
+    if (props()?.previews) return this.initPreviews(cx);
     if (props()?.page) {   // a markdown file as a tab's only pane
       this.reader = true;
       this.it = { kind: "md", path: props().page, name: String(props().page).split("/").pop() };
@@ -87,6 +88,157 @@ export default class Viewer extends View {
       await drain();
       for (;;) { await watchFolder(INBOX()); await drain().catch(() => {}); }
     });
+  }
+
+  // ---- the Preview tab ------------------------------------------------------------------
+  // One per space (props { previews: true, space }): what the agents of the space showed, newest
+  // first, in a list at the left; the chosen file at the right. view.py writes the list
+  // (data/scribble/previews/<space>.jsonl) and names the tab "Preview · N new"; looking at the
+  // tab marks all of it seen.
+
+  initPreviews(cx) {
+    this.previews = true;
+    this.entries = [];      // newest first, one per path
+    this.pick = null;       // the chosen entry's id
+    this.sort = localStorage.getItem("sort") === "agent" ? "agent" : "time";
+    this.made = {};         // path -> what view.py add made of an image
+    this.docs = {};         // path -> text
+    this.lastSeen = "0";
+    const dir = `${appHome()}/data/scribble/previews`, sp = props().space;
+    const read = async () => {
+      const text = await readTextFile(`${dir}/${sp}.jsonl`).catch(() => "");
+      const byPath = new Map();
+      for (const line of text.split("\n")) { try { const e = JSON.parse(line); if (e?.path) byPath.set(e.path, e); } catch { /* not a line */ } }
+      const next = [...byPath.values()].sort((a, b) => (BigInt(b.id) > BigInt(a.id) ? 1 : -1));
+      const followed = !this.pick || this.pick === this.entries[0]?.id;   // on the newest: stay on the newest
+      this.entries = next;
+      this.lastSeen = (await readTextFile(`${dir}/${sp}.seen`).catch(() => "0")).trim() || "0";
+      if (followed || !next.some((e) => e.id === this.pick)) this.choose(next[0], cx);
+    };
+    cx.spawn(async (cx) => {
+      await fs.mkdir(dir, { recursive: true }).catch(() => {});
+      await read(); cx.notify();
+      for (;;) { await watchFolder(dir); await read().catch(() => {}); cx.notify(); }
+    });
+    cx.timer.every(3000, (cx) => { const e = this.chosen(); if (e?.kind === "md") this.loadDoc(e, cx); });
+    cx.timer.every(30000, (cx) => cx.notify());   // the ages
+  }
+
+  chosen() { return this.entries.find((e) => e.id === this.pick) ?? null; }
+
+  choose(e, cx) {
+    this.pick = e?.id ?? null;
+    if (!e) return;
+    if (e.kind === "md") this.loadDoc(e, cx);
+    else if (e.kind === "image" && !this.made[e.path]) cx.spawn(async (cx) => {
+      try { this.made[e.path] = (await script(["add", e.path]))[0]; } catch (err) { this.made[e.path] = { kind: "error", error: String(err?.message ?? err) }; }
+      cx.notify();
+    });
+  }
+
+  loadDoc(e, cx) {
+    cx.spawn(async (cx) => {
+      const text = (await readTextFile(e.path).catch(() => null)) ?? "(can't read the file)";
+      if (text !== this.docs[e.path]) { this.docs[e.path] = text; cx.notify(); }
+    });
+  }
+
+  // The person looked: everything on the list is seen, and the tab is "Preview" again.
+  looked(cx) {
+    const top = this.entries[0]?.id;
+    if (!top || top === this.lastSeen || this.marking) return;
+    this.marking = true;
+    this.lastSeen = top;
+    const dir = `${appHome()}/data/scribble/previews`, sp = props().space;
+    cx.spawn(async (cx) => {
+      await fs.writeFile(`${dir}/${sp}.seen`, top).catch(() => {});
+      const tab = (await readTextFile(`${dir}/${sp}.tab`).catch(() => "")).trim();
+      if (tab) run("tab.rename", { id: tab, name: "Preview" });
+      this.marking = false;
+      cx.notify();
+    });
+  }
+
+  annotate(e) {
+    const it = this.made[e.path];
+    if (!it || it.kind !== "image") return;
+    const space = spaces().find((s) => s.id === props().space);
+    run("tab.new", { space: props().space, name: it.name, mod: "scribble",
+      props: { editor: true, item: it, terminal: e.from?.terminal ?? null, folder: space && !space.machine ? space.folder : null } });
+  }
+
+  previewList(t) {
+    const fresh = (e) => BigInt(e.id) > BigInt(this.lastSeen || "0");
+    const when = (e) => { const s = (Date.now() - e.t) / 1000; return s < 90 ? "now" : s < 5400 ? `${Math.round(s / 60)}m` : s < 129600 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`; };
+    const TAG = { image: ["IMG", "#5aa9ff"], md: ["MD", "#4cd08a"], file: ["FILE", "#b48cff"] };
+    const row = (e) => {
+      const on = e.id === this.pick, [tag, color] = TAG[e.kind] ?? TAG.file;
+      return h_flex().id(`pv-${e.id}`).h(46).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer()
+        .when(on, (el) => el.bg(t.selected)).when(!on, (el) => el.hover((s) => s.bg(t.hover)))
+        .on_click((_e, cx) => { this.choose(e, cx); cx.notify(); })
+        .on_mouse_down("right", () => { exec("/usr/bin/open", ["-R", e.path]); })   // right click: show it in Finder
+        .child(div().w(34).h(22).flex_none().rounded(4).bg(`${color}26`).flex().items_center().justify_center().text_size(9).font_semibold().text_color(color).child(tag))
+        .child(v_flex().flex_1().min_w(0).gap(1)
+          .child(div().truncate().text_size(12.5).text_color(on || fresh(e) ? t.foreground : t.muted).when(fresh(e), (el) => el.font_semibold()).child(e.path.split("/").pop()))
+          .child(div().truncate().text_size(10.5).text_color(t.dim).child(`${e.from?.name ?? "unknown"} · ${when(e)}`)))
+        .when(fresh(e), (el) => el.child(div().size(7).flex_none().rounded_full().bg(t.accent)));
+    };
+    let rows;
+    if (this.sort === "agent") {
+      const names = [...new Set(this.entries.map((e) => e.from?.name ?? "unknown"))];
+      rows = names.flatMap((n) => [div().id(`pv-agent-${n}`).h(22).flex_none().px(8).pt(6).text_size(10.5).font_medium().text_color(t.dim).child(n),
+        ...this.entries.filter((e) => (e.from?.name ?? "unknown") === n).map(row)]);
+    } else rows = this.entries.map(row);
+    const tab = (id, label) => div().id(`sort-${id}`).h(22).px(8).flex().items_center().rounded(5).cursor_pointer().text_size(11)
+      .bg(this.sort === id ? t.selected : t.background).text_color(this.sort === id ? t.foreground : t.muted)
+      .on_click((_e, cx) => { this.sort = id; localStorage.setItem("sort", id); cx.notify(); }).child(label);
+    return v_flex().w(264).flex_none().h_full().border_r(1).border_color(t.border)
+      .child(h_flex().h(38).flex_none().px(10).gap(4).items_center().border_b(1).border_color(t.border)
+        .child(div().flex_1().text_size(12).font_semibold().child(`${this.entries.length} files`))
+        .child(tab("time", "Newest")).child(tab("agent", "By agent")))
+      .child(v_flex().id("pv-list").flex_1().min_h(0).p(4).gap(1).overflow_y_scrollbar().children(rows));
+  }
+
+  previewPane(t) {
+    const e = this.chosen();
+    if (!e) return div().flex_1().flex().items_center().justify_center().text_size(12.5).text_color(t.muted).child("Nothing shown here yet");
+    const it = this.made[e.path];
+    const head = h_flex().flex_none().flex_wrap().px(12).py(6).gap(6).items_center().border_b(1).border_color(t.border)
+      .child(v_flex().flex_1().min_w(120)
+        .child(div().truncate().text_size(13).font_medium().child(e.path.split("/").pop()))
+        .child(div().truncate().text_size(10.5).text_color(t.dim).child(`from ${e.from?.name ?? "unknown"} · ${e.path}`)))
+      .when(e.kind === "image" && it?.kind === "image", (el) => el.child(this.btn("pv-annotate", "Annotate", t, () => this.annotate(e), false, true)))
+      .child(this.btn("pv-open", e.kind === "file" ? "Play / open" : "Open", t, () => { exec("/usr/bin/open", [e.path]); }))
+      .child(this.btn("pv-reveal", "Show in Finder", t, () => { exec("/usr/bin/open", ["-R", e.path]); }))
+      .child(this.btn("pv-copy", "Copy path", t, () => { exec("/bin/sh", ["-c", 'printf "%s" "$1" | /usr/bin/pbcopy', "copy", e.path]); }));
+    let body;
+    if (e.kind === "md") {
+      const text = this.docs[e.path] ?? "";
+      body = div().id(`pv-doc-${e.id}`).flex_1().min_h(0).w_full().overflow_y_scrollbar().px(24).py(16)
+        .child(div().w_full().max_w(900).min_w(0).text_size(14).text_color(t.foreground)
+          .child(/\.(md|markdown|mdx)$/i.test(e.path) ? TextView.markdown(`pv-md-${e.id}`, text || " ").selectable(true)
+            : div().font_family("Menlo").text_size(12.5).children(text.split("\n").slice(0, 4000).map((l) => div().min_h(17).child(l || " ")))));
+    } else if (e.kind === "image") {
+      const s = this.stage ?? { width: 600, height: 400 };
+      if (it?.kind === "image") {
+        const k = Math.min(1, (s.width - 24) / it.w, (s.height - 24) / it.h), w = it.w * k, h = it.h * k;
+        body = div().id("pv-stage").relative().flex_1().min_h(0).w_full().overflow_hidden().bg(t.canvas)
+          .on_size_change((size, cx) => { this.stage = size; cx.notify(); })
+          .child(div().absolute().left(Math.round((s.width - w) / 2)).top(Math.round((s.height - h) / 2)).w(Math.round(w)).h(Math.round(h)).child(image(it.rel).size_full()));
+      } else body = div().id("pv-stage").flex_1().flex().items_center().justify_center().text_size(12.5).text_color(it ? t.blocked : t.muted)
+        .on_size_change((size, cx) => { this.stage = size; cx.notify(); }).child(it ? `Can't show it: ${it.error ?? "not an image"}` : "Opening…");
+    } else {
+      body = v_flex().flex_1().items_center().justify_center().gap(8).text_color(t.muted)
+        .child(div().text_size(13).child("This kind of file opens outside Herdr."))
+        .child(div().text_size(11.5).text_color(t.dim).child("Use Play / open, or Show in Finder."));
+    }
+    return v_flex().flex_1().min_w(0).h_full().child(head).child(body);
+  }
+
+  previewsView(t) {
+    return h_flex().id("previews").size_full().bg(t.background).text_color(t.foreground)
+      .on_mouse_move((_e, cx) => this.looked(cx))
+      .child(this.previewList(t)).child(this.previewPane(t));
   }
 
   // ---- the tray --------------------------------------------------------------------------
@@ -545,6 +697,7 @@ export default class Viewer extends View {
   render() {
     const t = theme();
     if (this.button) return this.bar_button(t);
+    if (this.previews) return this.previewsView(t);
     if (this.reader) return v_flex().id("reader").size_full().bg(t.background).text_color(t.foreground)
       .child(h_flex().flex_none().px(12).py(6).gap(6).items_center().border_b(1).border_color(t.border)
         .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(this.it.path))
