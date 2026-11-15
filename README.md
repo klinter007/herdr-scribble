@@ -12,9 +12,9 @@ small tray, mark it up, and one click pastes the marked image into your agent's 
 
 - **Tray.** A narrow column on the right of the window. Drop an image on it, or
   click it and press Cmd+V to paste a screenshot. Each space keeps its own images.
-- **Editor.** A new image, or a click on a thumbnail, opens a large dialog. Draw
+- **Editor.** An image that you drop or paste, or a click on a thumbnail, opens the editor in a tab of its own. Draw
   with Pen, Box, Arrow and Text in six colors. Undo with Cmd+Z.
-- **Insert to chat.** Saves the marked image, closes the dialog and pastes the
+- **Insert to chat.** Saves the marked image, closes the tab and pastes the
   image into the terminal that had the focus (Cmd+Enter does the same). Copy image
   and Copy path are there too.
 - **A copy in your project.** Every marked image is also saved in
@@ -22,8 +22,8 @@ small tray, mark it up, and one click pastes the marked image into your agent's 
   In a Git repository the folder is added to `.git/info/exclude`, so it stays
   out of your commits.
 - **For agents.** `python3 ~/.config/herdr-app/mods/scribble/view.py <image>`
-  puts an image in the tray and opens it, so an agent can show you a picture
-  inside Herdr. A markdown file given to the same command opens in a tab of its own.
+  puts an image in the tray of that agent's space. It does not open and takes no
+  focus: it waits there with a mark, and the Images button shows a dot. A markdown file given to the same command opens in a tab of its own.
 
 ## Install
 

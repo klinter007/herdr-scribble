@@ -14,7 +14,7 @@
 
 import { View, div, image, svg, PathBuilder } from "gpui-kit";
 import { v_flex, h_flex, TextView, InputState, Input } from "gpui-base";
-import { exec, props, focused, panes, spaces, run, theme, notify, appHome, readTextFile, watchFolder, shared, setShared, openOverlay, closeOverlay, layout, nextCommand } from "herdr";
+import { exec, props, focused, panes, spaces, agents, run, theme, notify, appHome, readTextFile, watchFolder, shared, setShared, openOverlay, closeOverlay, layout, nextCommand } from "herdr";
 import * as fs from "fs/promises";
 
 const PY = "python3";   // needs Pillow: python3 -m pip install pillow
@@ -50,8 +50,20 @@ export default class Viewer extends View {
       return;
     }
     try { this.by = JSON.parse(localStorage.getItem("items") ?? "{}"); } catch { this.by = {}; }
+    // A tab opened for one file (the `open` wrapper: props { files: [path], terminal? }) is the
+    // editor for that image, in place: no tray, no second tab.
     const first = props()?.files ?? [];
-    if (first.length) this.add(first, cx, null);
+    if (first.length) {
+      this.viewer = true;
+      cx.spawn(async (cx) => {
+        try {
+          const it = (await script(["add", ...first])).find((x) => x.kind === "image");
+          if (it) { this.editor = true; this.initEditor(cx, it); } else this.viewerError = "This file is not an image.";
+        } catch (e) { this.viewerError = String(e?.message ?? e); }
+        cx.notify();
+      });
+      return;
+    }
     // What agents send (view.py) waits in a queue file. This tray takes what is newer than what
     // it took last, also what came while it was closed; nothing opens and nothing moves.
     // Only the tray takes from the queue; a pane opened for some files (an older view.py) does not.
@@ -305,8 +317,8 @@ export default class Viewer extends View {
 
   // ---- the editor ------------------------------------------------------------------------
 
-  initEditor(cx) {
-    this.it = props().item;
+  initEditor(cx, item = props().item) {
+    this.it = item;
     this.shapes = [...(shared(MARKS)?.[this.it.path] ?? [])];
     this.tool = "pen"; this.color = COLORS[0];
     this.draw = null; this.pending = null; this.stage = null; this.busy = "";
@@ -328,7 +340,23 @@ export default class Viewer extends View {
   shut() { props()?.overlay ? closeOverlay(props().overlay) : run("tab.close"); }
 
   flatten(mode) {
-    return script(["flatten", JSON.stringify({ path: this.it.path, shapes: this.shapes, mode, dir: props()?.folder, line: LINE, text: TEXT })]);
+    return script(["flatten", JSON.stringify({ path: this.it.path, shapes: this.shapes, mode, dir: this.projectFolder(), line: LINE, text: TEXT })]);
+  }
+
+  // The chat this image belongs to: the one it was opened from, else the terminal that sent it,
+  // else the most recent agent of the shown space.
+  chat() {
+    if (props()?.terminal) return props().terminal;
+    const space = spaces().find((s) => s.active)?.id;
+    return agents().filter((a) => a.space === space).sort((a, b) => b.seq - a.seq)[0]?.address ?? null;
+  }
+
+  // Where the marked copy is saved: the folder given, else the folder of the chat's space.
+  projectFolder() {
+    if (props()?.folder) return props().folder;
+    const a = agents().find((x) => x.address === this.chat());
+    const space = spaces().find((s) => s.id === a?.space) ?? spaces().find((s) => s.active);
+    return space && !space.machine ? space.folder : null;
   }
 
   copy(mode, cx) {
@@ -346,7 +374,7 @@ export default class Viewer extends View {
   // Saves the marked image in the project and puts it on the clipboard (a markdown file: its path),
   // closes the dialog, then pastes into the chat. The paste runs outside this copy, which is closing.
   insert(cx) {
-    const terminal = props()?.terminal;
+    const terminal = this.chat();
     if (this.busy) return;
     if (!terminal) return fail("No chat to insert into", "Click a terminal, then open the item again.");
     this.busy = "insert";
@@ -524,6 +552,8 @@ export default class Viewer extends View {
         .child(this.btn("md-open", "Open outside", t, () => { exec("/usr/bin/open", [this.it.path]); }))
         .child(this.btn("md-reveal", "Reveal", t, () => { exec("/usr/bin/open", ["-R", this.it.path]); })))
       .child(this.page(t));
+    if (this.viewer && !this.editor) return div().size_full().flex().items_center().justify_center().bg(t.background).text_size(12.5)
+      .text_color(this.viewerError ? t.blocked : t.muted).child(this.viewerError ?? "Opening…");
     if (!this.editor) return this.tray(t);
     return v_flex().id("editor").size_full().bg(t.background).text_color(t.foreground)
       .track_focus(this.handle)
