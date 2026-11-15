@@ -157,15 +157,32 @@ def app(command, args):
     return json.loads(r.stdout or '{}')
 
 
-def where(terminal):
-    """The tab and pane that hold a terminal, from the open window."""
-    r = subprocess.run(['herdr-app', 'ls'], capture_output=True, text=True, timeout=15)
-    if r.returncode: raise SystemExit(r.stderr.strip() or 'The Herdr window is not open')
-    for space in json.loads(r.stdout).get('spaces', []):
-        for tab in space['tabs']:
-            for t in tab['terminals']:
-                if t['terminal'] == terminal: return space['id'], tab['id'], t['pane']
-    return None, None, None
+def space_of(terminal):
+    """The space a terminal belongs to: its own label, else an ancestor's (a worker started by an
+    agent has none), else the space its `where` label names, else the space whose folder holds
+    its working directory. None when nothing says: never the space that happens to be in focus."""
+    import json as _j, subprocess as _s
+    def get(t):
+        try: return _j.loads(_s.run(["herdr-core", "get", t, "--json"], capture_output=True, text=True, timeout=15).stdout)
+        except Exception: return {}
+    t, seen, first = terminal, set(), None
+    while t and t not in seen:
+        seen.add(t)
+        g = get(t)
+        first = first or g
+        s = (g.get("labels") or {}).get("herdr.space")
+        if s: return s
+        t = g.get("parent")
+    try: spaces = _j.loads(_s.run(["herdr-app", "ls"], capture_output=True, text=True, timeout=15).stdout).get("spaces", [])
+    except Exception: spaces = []
+    for s in spaces:
+        if any(x.get("terminal") in seen for tab in s.get("tabs", []) for x in tab.get("terminals", [])): return s["id"]
+    name = str(((first or {}).get("labels") or {}).get("where") or "").split(" / ")[0].strip()
+    for s in spaces:
+        if name and s.get("name") == name: return s["id"]
+    cwd = str((first or {}).get("cwd") or "")
+    best = max((s for s in spaces if s.get("folder") and (cwd + "/").startswith(s["folder"].rstrip("/") + "/")), key=lambda s: len(s["folder"]), default=None)
+    return best["id"] if best else None
 
 
 def queue(files, space):
@@ -182,12 +199,12 @@ def show(paths, terminal=None):
     for f in files:
         if not os.path.isfile(f): raise SystemExit(f'No such file: {f}')
         if not kind(f): raise SystemExit(f'herdr-view shows images and markdown/text. Use `open` for: {f}')
-    space, _tab, _pane = where(terminal or os.environ.get('HC_TERMINAL_ID'))
+    space = space_of(terminal or os.environ.get('HC_TERMINAL_ID'))
     pages = [f for f in files if kind(f) == 'md']
     for f in pages:
-        args = {'name': Path(f).name, 'mod': 'scribble', 'props': {'page': f}}
-        if space: args['space'] = space
-        app('tab.new', args)
+        # in the caller's own space; with no space found, in the background and never in the space in focus
+        if space: app('tab.new', {'name': Path(f).name, 'mod': 'scribble', 'props': {'page': f}, 'space': space})
+        else: subprocess.run(['/usr/bin/open', '-g', f], timeout=15)
     images = [f for f in files if kind(f) == 'image']
     if images: queue(images, space)
     return {'shown': pages, 'waiting_in_tray': images}
