@@ -228,7 +228,7 @@ def preview_tab(space):
     return made
 
 
-def show(paths, terminal=None, record_only=False):
+def show(paths, terminal=None, record_only=False, if_new=False):
     """An agent shows files: each one goes on the list of its space's Preview tab, newest first.
     Nothing comes to the front: the tab's name says how many are new. `record_only`: the file was
     opened elsewhere (a browser); it is listed, and the tab is not made for it alone."""
@@ -243,6 +243,12 @@ def show(paths, terminal=None, record_only=False):
     PREVIEWS.mkdir(parents=True, exist_ok=True)
     listing = PREVIEWS / f'{space}.jsonl'
     old = [l for l in (listing.read_text().splitlines() if listing.exists() else []) if l.strip()]
+    if if_new:   # leave out what is on the list already and did not change since
+        listed = {}
+        for l in old:
+            e = json.loads(l); listed[e['path']] = max(listed.get(e['path'], 0), e.get('t', 0))
+        files = [f for f in files if f not in listed or os.stat(f).st_mtime * 1000 > listed[f] + 1000]
+        if not files: return {'listed_in_preview': [], 'space': space}
     who, now = source_of(terminal), int(time.time() * 1000)
     new = [json.dumps({'id': f'{time.time_ns() + n}', 'path': f, 'kind': kind(f) or 'file', 'from': who, 't': now}) for n, f in enumerate(files)]
     listing.write_text('\n'.join((old + new)[-300:]) + '\n')
@@ -267,10 +273,12 @@ def main(argv):
     elif cmd == 'flatten': out = flatten(json.loads(rest[0]))
     elif cmd == 'show':
         terminal, record = None, False
-        while rest[:1] and rest[0] in ('--terminal', '--record-only'):
+        fresh = False
+        while rest[:1] and rest[0] in ('--terminal', '--record-only', '--if-new'):
             if rest[0] == '--terminal': terminal, rest = rest[1], rest[2:]
+            elif rest[0] == '--if-new': fresh, rest = True, rest[1:]
             else: record, rest = True, rest[1:]
-        out = show(rest, terminal, record)
+        out = show(rest, terminal, record, fresh)
     else: out = show(argv)
     print(json.dumps(out))
 
