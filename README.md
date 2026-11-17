@@ -21,9 +21,10 @@ small tray, mark it up, and one click pastes the marked image into your agent's 
   `<project>/.scribble/`, where the project is the folder of the active space.
   In a Git repository the folder is added to `.git/info/exclude`, so it stays
   out of your commits.
-- **For agents.** `python3 ~/.config/herdr-app/mods/scribble/view.py <image>`
-  puts an image in the tray of that agent's space. It does not open and takes no
-  focus: it waits there with a mark, and the Images button shows a dot. A markdown file given to the same command opens in a tab of its own.
+- **For agents: one Preview tab per space.** `python3 ~/.config/herdr-app/mods/scribble/view.py show <file>`
+  puts a file on the list of the Preview tab of that agent's space: newest on top, with
+  the agent that sent it. Nothing comes to the front; the tab's name shows how many
+  are new. The tab shows markdown and images, and has Annotate, Open and Show in Finder.
 
 ## Install
 
