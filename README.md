@@ -55,7 +55,7 @@ Under 120 px the tray shows a "+" box and thumbnails only; wider, it also shows 
 
 ## Requirements
 
-- Herdr desktop app (built on 0.1.x), macOS.
+- Herdr desktop app, macOS. Built and tested on **Herdr app 0.1.16 with herdr-core 0.1.21**.
 - `python3` on your PATH with [Pillow](https://pypi.org/project/pillow/). The mod
   uses it to draw the marks on the full-size image.
 
