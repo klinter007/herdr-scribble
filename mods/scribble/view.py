@@ -228,6 +228,25 @@ def preview_tab(space):
     return made
 
 
+def tidy_previews():
+    """One line per file in every list, and each Preview tab named by the files not seen yet."""
+    for listing in PREVIEWS.glob('*.jsonl'):
+        space, newest = listing.stem, {}
+        for l in listing.read_text().splitlines():
+            if l.strip():
+                e = json.loads(l)
+                if e['path'] not in newest or int(e['id']) > int(newest[e['path']]['id']): newest[e['path']] = e
+        lines = sorted(newest.values(), key=lambda e: int(e['id']))
+        listing.write_text('\n'.join(json.dumps(e) for e in lines) + '\n')
+        note, seen = PREVIEWS / f'{space}.tab', PREVIEWS / f'{space}.seen'
+        if not note.exists(): continue
+        last = int(seen.read_text().strip() or 0) if seen.exists() else 0
+        fresh = sum(1 for e in lines if int(e['id']) > last)
+        subprocess.run(['herdr-app', 'do', 'tab.rename', json.dumps({'id': note.read_text().strip(), 'name': f'Preview · {fresh} new' if fresh else 'Preview'})], capture_output=True, timeout=15)
+        print(space[:10], len(lines), 'files,', fresh, 'new')
+    return {'ok': True}
+
+
 def show(paths, terminal=None, record_only=False, if_new=False):
     """An agent shows files: each one goes on the list of its space's Preview tab, newest first.
     Nothing comes to the front: the tab's name says how many are new. `record_only`: the file was
@@ -251,6 +270,7 @@ def show(paths, terminal=None, record_only=False, if_new=False):
         if not files: return {'listed_in_preview': [], 'space': space}
     who, now = source_of(terminal), int(time.time() * 1000)
     new = [json.dumps({'id': f'{time.time_ns() + n}', 'path': f, 'kind': kind(f) or 'file', 'from': who, 't': now}) for n, f in enumerate(files)]
+    old = [l for l in old if json.loads(l)['path'] not in files]   # one line per file: the newest
     listing.write_text('\n'.join((old + new)[-300:]) + '\n')
     tab = None if record_only else preview_tab(space)
     if not tab:
@@ -259,7 +279,7 @@ def show(paths, terminal=None, record_only=False, if_new=False):
     if tab:   # the tab says how many the person has not seen
         seen = PREVIEWS / f'{space}.seen'
         last = int(seen.read_text().strip() or 0) if seen.exists() else 0
-        fresh = sum(1 for l in old + new if int(json.loads(l)['id']) > last)
+        fresh = len({json.loads(l)['path'] for l in old + new if int(json.loads(l)['id']) > last})   # files, not lines
         subprocess.run(['herdr-app', 'do', 'tab.rename', json.dumps({'id': tab, 'name': f'Preview · {fresh} new' if fresh else 'Preview'})], capture_output=True, timeout=15)
     return {'listed_in_preview': files, 'space': space}
 
@@ -271,6 +291,7 @@ def main(argv):
     if cmd == 'add': out = add(rest)
     elif cmd == 'paste': out = paste()
     elif cmd == 'flatten': out = flatten(json.loads(rest[0]))
+    elif cmd == 'tidy-previews': out = tidy_previews()
     elif cmd == 'show':
         terminal, record = None, False
         fresh = False

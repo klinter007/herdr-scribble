@@ -105,21 +105,27 @@ export default class Viewer extends View {
     this.docs = {};         // path -> text
     this.lastSeen = "0";
     const dir = `${appHome()}/data/scribble/previews`, sp = props().space;
-    const read = async () => {
+    const read = async (cx) => {
       const text = await readTextFile(`${dir}/${sp}.jsonl`).catch(() => "");
+      const seen = (await readTextFile(`${dir}/${sp}.seen`).catch(() => "0")).trim() || "0";
+      if (text === this.listText && seen === this.lastSeen) return false;   // nothing new
+      this.listText = text;
       const byPath = new Map();
       for (const line of text.split("\n")) { try { const e = JSON.parse(line); if (e?.path) byPath.set(e.path, e); } catch { /* not a line */ } }
       const next = [...byPath.values()].sort((a, b) => (BigInt(b.id) > BigInt(a.id) ? 1 : -1));
       const followed = !this.pick || this.pick === this.entries[0]?.id;   // on the newest: stay on the newest
       this.entries = next;
-      this.lastSeen = (await readTextFile(`${dir}/${sp}.seen`).catch(() => "0")).trim() || "0";
+      this.lastSeen = seen;
       if (followed || !next.some((e) => e.id === this.pick)) this.choose(next[0], cx);
+      return true;
     };
     cx.spawn(async (cx) => {
       await fs.mkdir(dir, { recursive: true }).catch(() => {});
-      await read(); cx.notify();
-      for (;;) { await watchFolder(dir); await read().catch(() => {}); cx.notify(); }
+      await read(cx).catch(() => {}); cx.notify();
+      for (;;) { await watchFolder(dir); if (await read(cx).catch(() => false)) cx.notify(); }
     });
+    // The watch can miss a save (it did): the list is also read again every few seconds.
+    cx.timer.every(4000, (cx) => cx.spawn(async (cx) => { if (await read(cx).catch(() => false)) cx.notify(); }));
     cx.timer.every(3000, (cx) => { const e = this.chosen(); if (e?.kind === "md") this.loadDoc(e, cx); });
     cx.timer.every(30000, (cx) => cx.notify());   // the ages
   }
