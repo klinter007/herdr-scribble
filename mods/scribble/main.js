@@ -13,8 +13,8 @@
 // Marks are kept per file in shared "scribble.marks", so an image reopens with them.
 
 import { View, div, image, svg, PathBuilder } from "gpui-kit";
-import { v_flex, h_flex, TextView, InputState, Input } from "gpui-base";
-import { exec, props, focused, panes, spaces, agents, run, theme, notify, appHome, readTextFile, watchFolder, shared, setShared, openOverlay, closeOverlay, layout, nextCommand } from "herdr";
+import { v_flex, h_flex, TextView, InputState, Input, Editor, EditorState } from "gpui-base";
+import { exec, hc, props, focused, panes, spaces, agents, run, theme, settings, notify, writeTextFile, appHome, readTextFile, watchFolder, shared, setShared, openOverlay, closeOverlay, layout, nextCommand } from "herdr";
 import * as fs from "fs/promises";
 
 const PY = "python3";   // needs Pillow: python3 -m pip install pillow
@@ -127,6 +127,19 @@ export default class Viewer extends View {
     // The watch can miss a save (it did): the list is also read again every few seconds.
     cx.timer.every(4000, (cx) => cx.spawn(async (cx) => { if (await read(cx).catch(() => false)) cx.notify(); }));
     cx.timer.every(3000, (cx) => { const e = this.chosen(); if (e?.kind === "md") this.loadDoc(e, cx); });
+    // Key commands for the shown Preview tab: scribble.next / prev (the list), edit, save, send, cancel.
+    cx.spawn(async (cx) => {
+      for (;;) {
+        const c = await nextCommand(), e = this.chosen(), at = this.entries.findIndex((x) => x.id === this.pick);
+        if (c === "next" || c === "prev") this.choose(this.entries[Math.max(0, Math.min(this.entries.length - 1, at + (c === "next" ? 1 : -1)))], cx);
+        else if (!e) continue;
+        else if (c === "edit" && e.kind === "md") this.startEdit(e, cx);
+        else if (c === "save") this.saveEdit(e, false, cx);
+        else if (c === "send") this.saveEdit(e, true, cx);
+        else if (c === "cancel") this.stopEdit(e);
+        cx.notify();
+      }
+    });
     cx.timer.every(30000, (cx) => cx.notify());   // the ages
   }
 
@@ -161,6 +174,71 @@ export default class Viewer extends View {
       const tab = (await readTextFile(`${dir}/${sp}.tab`).catch(() => "")).trim();
       if (tab) run("tab.rename", { id: tab, name: "Preview" });
       this.marking = false;
+      cx.notify();
+    });
+  }
+
+  // ---- editing a markdown or text file in place ----
+  // Edit opens the file in an editor; Save writes it (only if it did not change on disk since);
+  // Save and send also tells the agent that showed it, with the changed lines, so the person
+  // and the agent work on one document.
+
+  startEdit(e, cx) {
+    cx.spawn(async (cx) => {
+      const text = await readTextFile(e.path).catch(() => null);
+      if (text === null) { fail("Can't open the file to edit", e.path); return; }
+      this.edits ??= {};
+      this.edits[e.path]?.state.release?.();
+      const t = theme();
+      this.edits[e.path] = { orig: text, saving: false, state: EditorState.new({ language: /\.(md|markdown|mdx)$/i.test(e.path) ? "markdown" : "text", value: text,
+        line_numbers: false, folding: false, soft_wrap: true, font_family: settings().font_family, font_size: 13.5,
+        syntax: { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6 } }) };
+      cx.notify();
+    });
+  }
+
+  stopEdit(e) { const ed = this.edits?.[e.path]; if (ed) { ed.state.release?.(); delete this.edits[e.path]; } }
+
+  // The agent to tell: the one that showed the file if it still runs, else the newest agent of this space.
+  editTarget(e) {
+    const mine = agents().filter((a) => a.space === props().space);
+    return (mine.find((a) => a.address === e.from?.terminal) ?? mine.sort((a, b) => b.seq - a.seq)[0])?.address ?? null;
+  }
+
+  saveEdit(e, send, cx) {
+    const ed = this.edits?.[e.path];
+    if (!ed || ed.saving) return;
+    const text = ed.state.value(), before = ed.orig;
+    if (text === before && !send) { this.stopEdit(e); return; }
+    ed.saving = true;
+    cx.spawn(async (cx) => {
+      try {
+        if (text !== before) await writeTextFile(e.path, text, before);
+        this.docs[e.path] = text;
+        if (send) {
+          const to = this.editTarget(e);
+          if (!to) throw new Error("No agent in this space to send to. The file is saved.");
+          // the changed lines, when they are few: the agent sees what moved without reading it all
+          let diff = "";
+          if (text !== before) {
+            const old = `${appHome()}/data/scribble/edit-before.txt`;
+            await fs.writeFile(old, before).catch(() => {});
+            const r = await exec("/usr/bin/diff", ["-u", "--label", "before", "--label", "after", old, e.path]).catch(() => null);
+            const lines = (r?.stdout ?? "").split("\n");
+            if (lines.length > 1 && lines.length <= 90) diff = `\n\nWhat I changed:\n\`\`\`diff\n${lines.join("\n").trim()}\n\`\`\``;
+          }
+          const said = text === before ? `I read \`${e.path}\` in Herdr and did not change it.`
+            : `I edited \`${e.path}\` in Herdr and saved it. Read it again before you go on: my version is the current one.${diff}`;
+          const r = await hc(["send", to, said]);
+          if (r.code !== 0) throw new Error((r.stderr || r.stdout || "hc send failed").trim());
+          notify({ title: "Saved and sent to the agent", body: e.path.split("/").pop(), level: "success", timeout: 4000 });
+        }
+        this.stopEdit(e);
+      } catch (err) {
+        ed.saving = false;
+        const m = String(err?.message ?? err);
+        fail(/stale|match|changed/i.test(m) ? "The file changed on disk since you opened it. Copy your text, press Cancel, then Edit again." : "Can't save", m);
+      }
       cx.notify();
     });
   }
@@ -208,17 +286,25 @@ export default class Viewer extends View {
   previewPane(t) {
     const e = this.chosen();
     if (!e) return div().flex_1().flex().items_center().justify_center().text_size(12.5).text_color(t.muted).child("Nothing shown here yet");
-    const it = this.made[e.path];
+    const it = this.made[e.path], ed = this.edits?.[e.path] ?? null;
     const head = h_flex().flex_none().flex_wrap().px(12).py(6).gap(6).items_center().border_b(1).border_color(t.border)
       .child(v_flex().flex_1().min_w(120)
         .child(div().truncate().text_size(13).font_medium().child(e.path.split("/").pop()))
         .child(div().truncate().text_size(10.5).text_color(t.dim).child(`from ${e.from?.name ?? "unknown"} · ${e.path}`)))
       .when(e.kind === "image" && it?.kind === "image", (el) => el.child(this.btn("pv-annotate", "Annotate", t, () => this.annotate(e), false, true)))
-      .child(this.btn("pv-open", e.kind === "file" ? "Play / open" : "Open", t, () => { exec("/usr/bin/open", [e.path]); }))
-      .child(this.btn("pv-reveal", "Show in Finder", t, () => { exec("/usr/bin/open", ["-R", e.path]); }))
-      .child(this.btn("pv-copy", "Copy path", t, () => { exec("/bin/sh", ["-c", 'printf "%s" "$1" | /usr/bin/pbcopy', "copy", e.path]); }));
+      .when(Boolean(ed), (el) => el
+        .child(this.btn("pv-send", ed?.saving ? "Saving…" : "Save and send to chat", t, (cx) => this.saveEdit(e, true, cx), false, true))
+        .child(this.btn("pv-save", "Save", t, (cx) => this.saveEdit(e, false, cx)))
+        .child(this.btn("pv-cancel", "Cancel", t, () => this.stopEdit(e))))
+      .when(!ed && e.kind === "md", (el) => el.child(this.btn("pv-edit", "Edit", t, (cx) => this.startEdit(e, cx), false, true)))
+      .when(!ed, (el) => el
+        .child(this.btn("pv-open", e.kind === "file" ? "Play / open" : "Open", t, () => { exec("/usr/bin/open", [e.path]); }))
+        .child(this.btn("pv-reveal", "Show in Finder", t, () => { exec("/usr/bin/open", ["-R", e.path]); }))
+        .child(this.btn("pv-copy", "Copy path", t, () => { exec("/bin/sh", ["-c", 'printf "%s" "$1" | /usr/bin/pbcopy', "copy", e.path]); })));
     let body;
-    if (e.kind === "md") {
+    if (ed) {
+      body = div().id(`pv-edit-${e.id}`).flex_1().min_h(0).w_full().child(Editor.new(ed.state).size_full());
+    } else if (e.kind === "md") {
       const text = this.docs[e.path] ?? "";
       body = div().id(`pv-doc-${e.id}`).flex_1().min_h(0).w_full().overflow_y_scrollbar().px(24).py(16)
         .child(div().w_full().max_w(900).min_w(0).text_size(14).text_color(t.foreground)
