@@ -6,7 +6,7 @@
   view.py paste               the clipboard's image as an item; prints JSON
   view.py flatten <json>      draw the marks on the image, copy it; prints JSON
 """
-import json, os, subprocess, sys, time, zlib
+import json, os, shutil, subprocess, sys, time, zlib
 from pathlib import Path
 
 HOME = Path(os.environ.get('HERDR_APP_HOME') or Path.home() / '.config/herdr-app')
@@ -23,9 +23,13 @@ def kind(path):
     return 'image' if s in IMAGES else 'md' if s in TEXTS else None
 
 
-def prune(folder, keep):
-    files = sorted((p for p in folder.iterdir() if p.is_file()), key=lambda p: p.stat().st_mtime)
-    for p in files[:-keep]:
+def prune(folder, keep, protect=()):
+    protected = {Path(p).resolve() for p in protect}
+    files = sorted(
+        (p for p in folder.iterdir() if p.is_file() and p.resolve() not in protected),
+        key=lambda p: p.stat().st_mtime,
+    )
+    for p in (files[:-keep] if keep > 0 else files):
         p.unlink(missing_ok=True)
 
 
@@ -38,29 +42,36 @@ def image_item(path):
         w, h = im.size
         if path.suffix.lower() in NATIVE:
             dest = SRC / f'{stamp}{path.suffix.lower()}'
+            if dest.exists() and dest.stat().st_nlink > 1:
+                dest.unlink(missing_ok=True)
             if not dest.exists():
-                try: os.link(path, dest)
-                except OSError: dest.write_bytes(path.read_bytes())
+                shutil.copyfile(path, dest)
+            else:
+                os.utime(dest, None)
         else:
             dest = SRC / f'{stamp}.png'
             if not dest.exists(): im.convert('RGBA').save(dest)
+            else: os.utime(dest, None)
     return {'kind': 'image', 'path': str(path), 'name': path.name, 'w': w, 'h': h,
             'rel': str(dest.relative_to(HOME))}
 
 
 def add(paths):
-    items = []
+    items, created = [], []
     for p in paths:
         p = os.path.expanduser(p)
         k = kind(p)
         try:
             if not os.path.isfile(p): raise ValueError('not a file')
-            if k == 'image': items.append(image_item(p))
+            if k == 'image':
+                it = image_item(p)
+                items.append(it)
+                created.append(HOME / it['rel'])
             elif k == 'md': items.append({'kind': 'md', 'path': str(Path(p).resolve()), 'name': Path(p).name})
             else: raise ValueError('not an image or a markdown file')
         except Exception as e:
             items.append({'kind': 'error', 'name': Path(p).name, 'error': str(e)})
-    if SRC.exists(): prune(SRC, 60)
+    if SRC.exists(): prune(SRC, 60, protect=created)
     return items
 
 
@@ -207,6 +218,94 @@ def source_of(terminal):
     return {'terminal': terminal, 'name': name}
 
 
+def parse_int(val, default=0):
+    try:
+        return int(str(val).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def is_previewable(entry):
+    return entry.get('kind') in ('md', 'image') and not entry.get('record_only')
+
+
+def parse_preview_lines(raw, existing_only=True):
+    """Deduplicate preview JSONL lines by path (newest id wins), optionally dropping missing files.
+    Returns (entries_newest_first, max_id)."""
+    newest, max_id = {}, 0
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(e, dict) or not e.get('path'):
+            continue
+        eid = parse_int(e.get('id'), 0)
+        if eid <= 0:
+            continue
+        if eid > max_id:
+            max_id = eid
+        path = e['path']
+        if path not in newest or eid > parse_int(newest[path].get('id'), 0):
+            newest[path] = e
+    entries = list(newest.values())
+    if existing_only:
+        entries = [e for e in entries if os.path.isfile(e['path'])]
+    entries.sort(key=lambda e: parse_int(e.get('id'), 0), reverse=True)
+    return entries, max_id
+
+
+def read_seen(space):
+    seen = PREVIEWS / f'{space}.seen'
+    return parse_int(seen.read_text(), 0) if seen.exists() else 0
+
+
+def fresh_count(entries, seen_id):
+    """Count unseen previewable entries (matches the Preview tab's unread items)."""
+    return sum(1 for e in entries if is_previewable(e) and parse_int(e.get('id'), 0) > seen_id)
+
+
+def preview_tab_name(fresh):
+    return f'Preview · {fresh} new' if fresh > 0 else 'Preview'
+
+
+def list_previews(space):
+    listing = PREVIEWS / f'{space}.jsonl'
+    raw = listing.read_text() if listing.exists() else ''
+    entries, max_id = parse_preview_lines(raw, existing_only=True)
+    seen_id = read_seen(space)
+    note = PREVIEWS / f'{space}.tab'
+    tab = note.read_text().strip() if note.exists() else ''
+    top_id = max(max_id, seen_id)
+    return {
+        'entries': entries,
+        'seen': str(seen_id),
+        'max_id': str(top_id),
+        'fresh': fresh_count(entries, seen_id),
+        'tab': tab,
+    }
+
+
+def preview_counts():
+    """Read-only per-space preview counts (does not modify any .jsonl files)."""
+    out = {}
+    if not PREVIEWS.exists():
+        return out
+    for note in PREVIEWS.glob('*.tab'):
+        space = note.stem
+        tab = note.read_text().strip()
+        if not tab:
+            continue
+        listing = PREVIEWS / f'{space}.jsonl'
+        raw = listing.read_text() if listing.exists() else ''
+        entries, _ = parse_preview_lines(raw, existing_only=True)
+        seen_id = read_seen(space)
+        out[space] = {'tab': tab, 'fresh': fresh_count(entries, seen_id), 'total': len(entries)}
+    return out
+
+
 def preview_tab(space):
     """The one Preview tab of a space: made the first time, in the background, then reused."""
     PREVIEWS.mkdir(parents=True, exist_ok=True)
@@ -217,33 +316,26 @@ def preview_tab(space):
     mine = next((sp for sp in listing if sp['id'] == space), None)
     if not mine: return None
     if known and any(t['id'] == known for t in mine['tabs']): return known
-    try: before = json.loads(subprocess.run(['herdr-app', 'status'], capture_output=True, text=True, timeout=15).stdout)
-    except Exception: before = {}
-    front = next((t['id'] for t in mine['tabs'] if t.get('active')), None)
-    made = app('tab.new', {'space': space, 'name': 'Preview', 'mod': 'scribble', 'props': {'previews': True, 'space': space}}).get('tab')
+    made = app('tab.new', {
+        'space': space, 'name': 'Preview', 'mod': 'scribble',
+        'props': {'previews': True, 'space': space}, 'focus': False,
+    }).get('tab')
     if made: note.write_text(made)
-    # the space keeps the tab it showed, and the person keeps the pane they were in
-    if front: subprocess.run(['herdr-app', 'do', 'tab.select', json.dumps({'id': front})], capture_output=True, timeout=15)
-    if before.get('focused_pane'): subprocess.run(['herdr-app', 'do', 'pane.focus', json.dumps({'pane': before['focused_pane']})], capture_output=True, timeout=15)
     return made
 
 
 def tidy_previews():
-    """One line per file in every list, and each Preview tab named by the files not seen yet."""
+    """One line per existing file in every list, and each Preview tab named by the previewable files not seen yet."""
     for listing in PREVIEWS.glob('*.jsonl'):
-        space, newest = listing.stem, {}
-        for l in listing.read_text().splitlines():
-            if l.strip():
-                e = json.loads(l)
-                if e['path'] not in newest or int(e['id']) > int(newest[e['path']]['id']): newest[e['path']] = e
-        lines = sorted(newest.values(), key=lambda e: int(e['id']))
-        listing.write_text('\n'.join(json.dumps(e) for e in lines) + '\n')
-        note, seen = PREVIEWS / f'{space}.tab', PREVIEWS / f'{space}.seen'
+        space = listing.stem
+        entries, _ = parse_preview_lines(listing.read_text(), existing_only=True)
+        ordered = list(reversed(entries))[-300:]
+        listing.write_text(('\n'.join(json.dumps(e) for e in ordered) + '\n') if ordered else '')
+        note = PREVIEWS / f'{space}.tab'
         if not note.exists(): continue
-        last = int(seen.read_text().strip() or 0) if seen.exists() else 0
-        fresh = sum(1 for e in lines if int(e['id']) > last)
-        subprocess.run(['herdr-app', 'do', 'tab.rename', json.dumps({'id': note.read_text().strip(), 'name': f'Preview · {fresh} new' if fresh else 'Preview'})], capture_output=True, timeout=15)
-        print(space[:10], len(lines), 'files,', fresh, 'new')
+        fresh = fresh_count(ordered, read_seen(space))
+        subprocess.run(['herdr-app', 'do', 'tab.rename', json.dumps({'id': note.read_text().strip(), 'name': preview_tab_name(fresh)})], capture_output=True, timeout=15)
+        print(space[:10], len(ordered), 'files,', fresh, 'new')
     return {'ok': True}
 
 
@@ -261,26 +353,30 @@ def show(paths, terminal=None, record_only=False, if_new=False):
         return {'shown': [], 'opened_outside': files}
     PREVIEWS.mkdir(parents=True, exist_ok=True)
     listing = PREVIEWS / f'{space}.jsonl'
-    old = [l for l in (listing.read_text().splitlines() if listing.exists() else []) if l.strip()]
+    raw = listing.read_text() if listing.exists() else ''
+    existing, _ = parse_preview_lines(raw, existing_only=True)
     if if_new:   # leave out what is on the list already and did not change since
-        listed = {}
-        for l in old:
-            e = json.loads(l); listed[e['path']] = max(listed.get(e['path'], 0), e.get('t', 0))
+        listed = {e['path']: e.get('t', 0) for e in existing}
         files = [f for f in files if f not in listed or os.stat(f).st_mtime * 1000 > listed[f] + 1000]
         if not files: return {'listed_in_preview': [], 'space': space}
     who, now = source_of(terminal), int(time.time() * 1000)
-    new = [json.dumps({'id': f'{time.time_ns() + n}', 'path': f, 'kind': kind(f) or 'file', 'from': who, 't': now}) for n, f in enumerate(files)]
-    old = [l for l in old if json.loads(l)['path'] not in files]   # one line per file: the newest
-    listing.write_text('\n'.join((old + new)[-300:]) + '\n')
+    base_id = time.time_ns()
+    new_entries = []
+    for n, f in enumerate(files):
+        entry = {'id': f'{base_id + n}', 'path': f, 'kind': kind(f) or 'file', 'from': who, 't': now}
+        if record_only:
+            entry['record_only'] = True
+        new_entries.append(entry)
+    kept = [e for e in reversed(existing) if e['path'] not in files]   # oldest first, one line per file
+    combined = (kept + new_entries)[-300:]
+    listing.write_text('\n'.join(json.dumps(e) for e in combined) + '\n')
     tab = None if record_only else preview_tab(space)
     if not tab:
         note = PREVIEWS / f'{space}.tab'
         tab = note.read_text().strip() if note.exists() else None
-    if tab:   # the tab says how many the person has not seen
-        seen = PREVIEWS / f'{space}.seen'
-        last = int(seen.read_text().strip() or 0) if seen.exists() else 0
-        fresh = len({json.loads(l)['path'] for l in old + new if int(json.loads(l)['id']) > last})   # files, not lines
-        subprocess.run(['herdr-app', 'do', 'tab.rename', json.dumps({'id': tab, 'name': f'Preview · {fresh} new' if fresh else 'Preview'})], capture_output=True, timeout=15)
+    if tab:   # the tab says how many previewable existing files the person has not seen
+        fresh = fresh_count(combined, read_seen(space))
+        subprocess.run(['herdr-app', 'do', 'tab.rename', json.dumps({'id': tab, 'name': preview_tab_name(fresh)})], capture_output=True, timeout=15)
     return {'listed_in_preview': files, 'space': space}
 
 
@@ -291,6 +387,8 @@ def main(argv):
     if cmd == 'add': out = add(rest)
     elif cmd == 'paste': out = paste()
     elif cmd == 'flatten': out = flatten(json.loads(rest[0]))
+    elif cmd == 'list': out = list_previews(rest[0]) if rest else {'error': 'missing space id'}
+    elif cmd == 'counts': out = preview_counts()
     elif cmd == 'tidy-previews': out = tidy_previews()
     elif cmd == 'show':
         terminal, record = None, False

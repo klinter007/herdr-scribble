@@ -14,7 +14,7 @@
 
 import { View, div, image, svg, PathBuilder } from "gpui-kit";
 import { v_flex, h_flex, TextView, InputState, Input, Editor, EditorState } from "gpui-base";
-import { exec, hc, props, focused, panes, spaces, agents, run, theme, settings, notify, writeTextFile, appHome, readTextFile, watchFolder, shared, setShared, openOverlay, closeOverlay, layout, nextCommand } from "herdr";
+import { exec, hc, props, focused, panes, spaces, agents, run, theme, settings, notify, writeTextFile, appHome, readTextFile, watchFolder, shared, setShared, openOverlay, closeOverlay, layout, nextCommand, checking } from "herdr";
 import * as fs from "fs/promises";
 
 const PY = "python3";   // needs Pillow: python3 -m pip install pillow
@@ -27,6 +27,8 @@ const TOOLS = [["pen", "Pen"], ["box", "Box"], ["arrow", "Arrow"], ["text", "Tex
 const LINE = 0.004, TEXT = 0.022;   // line width and label text size, as parts of the image's long side
 const DROP = 96;                    // the drop area's height
 const clamp01 = (v) => Math.max(0, Math.min(1, v));
+const toBigInt = (v) => { try { return BigInt(String(v ?? "0").trim() || "0"); } catch { return 0n; } };
+const isPreviewable = (e) => (e?.kind === "md" || e?.kind === "image") && !e?.record_only;
 const fail = (title, e) => notify({ title, body: String(e?.message ?? e), level: "error" });
 
 async function script(args) {
@@ -69,16 +71,16 @@ export default class Viewer extends View {
     // it took last, also what came while it was closed; nothing opens and nothing moves.
     // Only the tray takes from the queue; a pane opened for some files (an older view.py) does not.
     this.isTray = !props()?.files && !props()?.tab;
-    if (this.isTray) cx.spawn(async (cx) => {
+    if (this.isTray && !checking()) cx.spawn(async (cx) => {
       await fs.mkdir(INBOX(), { recursive: true }).catch(() => {});
-      this.taken = BigInt(localStorage.getItem("taken") ?? "0");
+      this.taken = toBigInt(localStorage.getItem("taken") ?? "0");
       const drain = async () => {
-        const text = await readTextFile(QUEUE()).catch(() => "");
+        const text = (await readTextFile(QUEUE()).catch(() => null)) ?? "";
         for (const line of text.split("\n")) {
           let m = null;
           try { m = JSON.parse(line); } catch { continue; }
-          if (!m?.id || BigInt(m.id) <= this.taken) continue;
-          this.taken = BigInt(m.id);
+          if (!m?.id || toBigInt(m.id) <= this.taken) continue;
+          this.taken = toBigInt(m.id);
           this.add(m.files ?? [], cx, m.space ?? null, true);
         }
         localStorage.setItem("taken", String(this.taken));
@@ -98,34 +100,83 @@ export default class Viewer extends View {
 
   initPreviews(cx) {
     this.previews = true;
-    this.entries = [];      // newest first, one per path
+    this.entries = [];      // newest first, existing files only, one per path
     this.pick = null;       // the chosen entry's id
     this.sort = localStorage.getItem("sort") === "agent" ? "agent" : "time";
     this.made = {};         // path -> what view.py add made of an image
     this.docs = {};         // path -> text
     this.lastSeen = "0";
+    this.diskSeen = "0";
+    this.maxId = "0";
+    this.tabId = "";
+    this.loaded = false;
+    this.wasShown = false;
+    this.pendingLook = false;
+    if (checking()) return;
     const dir = `${appHome()}/data/scribble/previews`, sp = props().space;
-    const read = async (cx) => {
-      const text = await readTextFile(`${dir}/${sp}.jsonl`).catch(() => "");
-      const seen = (await readTextFile(`${dir}/${sp}.seen`).catch(() => "0")).trim() || "0";
-      if (text === this.listText && seen === this.lastSeen) return false;   // nothing new
-      this.listText = text;
+    const parseLocal = (text) => {
       const byPath = new Map();
-      for (const line of text.split("\n")) { try { const e = JSON.parse(line); if (e?.path) byPath.set(e.path, e); } catch { /* not a line */ } }
-      const next = [...byPath.values()].sort((a, b) => (BigInt(b.id) > BigInt(a.id) ? 1 : -1));
-      const followed = !this.pick || this.pick === this.entries[0]?.id;   // on the newest: stay on the newest
+      let maxId = 0n;
+      for (const line of text.split("\n")) {
+        try {
+          const e = JSON.parse(line);
+          if (!e?.path || !e?.id) continue;
+          const id = toBigInt(e.id);
+          if (id <= 0n) continue;
+          if (id > maxId) maxId = id;
+          const prev = byPath.get(e.path);
+          if (!prev || id > toBigInt(prev.id)) byPath.set(e.path, e);
+        } catch { /* not a line */ }
+      }
+      const entries = [...byPath.values()].sort((a, b) => {
+        const ai = toBigInt(a.id), bi = toBigInt(b.id);
+        return bi > ai ? 1 : bi < ai ? -1 : 0;
+      });
+      return { entries, max_id: String(maxId) };
+    };
+    const read = async (cx, force = false) => {
+      const text = (await readTextFile(`${dir}/${sp}.jsonl`).catch(() => null)) ?? "";
+      const seen = ((await readTextFile(`${dir}/${sp}.seen`).catch(() => null)) ?? "0").trim() || "0";   // a missing file reads as null
+      const tab = ((await readTextFile(`${dir}/${sp}.tab`).catch(() => null)) ?? "").trim();
+      if (tab) this.tabId = tab;
+      if (!force && this.loaded && text === this.listText && seen === this.diskSeen) return false;   // nothing new
+      this.listText = text;
+      this.diskSeen = seen;
+      const listed = await script(["list", sp]).catch(() => parseLocal(text));
+      const next = Array.isArray(listed?.entries) ? listed.entries : [];
+      const serverSeen = String(listed?.seen ?? seen);
+      const effectiveSeen = this.marking && toBigInt(this.lastSeen) > toBigInt(serverSeen) ? this.lastSeen : serverSeen;
+      const maxId = String(listed?.max_id ?? (next[0]?.id ?? effectiveSeen));
+      const topPreviewable = this.entries.find(isPreviewable);
+      const followed = !this.pick || this.pick === this.entries[0]?.id || this.pick === topPreviewable?.id;   // on the newest: stay on the newest
       this.entries = next;
-      this.lastSeen = seen;
-      if (followed || !next.some((e) => e.id === this.pick)) this.choose(next[0], cx);
+      this.lastSeen = effectiveSeen;
+      this.maxId = maxId;
+      this.loaded = true;
+      if (followed || !next.some((e) => e.id === this.pick)) {
+        const firstFresh = next.find((e) => isPreviewable(e) && toBigInt(e.id) > toBigInt(effectiveSeen));
+        this.choose(firstFresh ?? next.find(isPreviewable) ?? next[0], cx);
+      }
+      if (this.isShown()) {
+        this.wasShown = true;
+        this.pendingLook = false;
+        this.looked(cx);
+      } else {
+        this.wasShown = false;
+      }
       return true;
     };
+    this.readPreviews = read;
     cx.spawn(async (cx) => {
       await fs.mkdir(dir, { recursive: true }).catch(() => {});
-      await read(cx).catch(() => {}); cx.notify();
+      await read(cx, true).catch(() => {}); cx.notify();
       for (;;) { await watchFolder(dir); if (await read(cx).catch(() => false)) cx.notify(); }
     });
     // The watch can miss a save (it did): the list is also read again every few seconds.
-    cx.timer.every(4000, (cx) => cx.spawn(async (cx) => { if (await read(cx).catch(() => false)) cx.notify(); }));
+    cx.timer.every(4000, (cx) => cx.spawn(async (cx) => {
+      if (!this.isShown()) this.wasShown = false;
+      if (await read(cx).catch(() => false)) cx.notify();
+    }));
     cx.timer.every(3000, (cx) => { const e = this.chosen(); if (e?.kind === "md") this.loadDoc(e, cx); });
     // Key commands for the shown Preview tab: scribble.next / prev (the list), edit, save, send, cancel.
     cx.spawn(async (cx) => {
@@ -143,14 +194,32 @@ export default class Viewer extends View {
     cx.timer.every(30000, (cx) => cx.notify());   // the ages
   }
 
+  previewTab() {
+    const sp = props().space;
+    const space = spaces().find((s) => s.id === sp);
+    if (!space) return null;
+    if (this.tabId) {
+      const t = space.tabs.find((x) => x.id === this.tabId);
+      if (t) return { space, tab: t };
+    }
+    const byName = space.tabs.find((x) => x.name === "Preview" || x.name.startsWith("Preview · "));
+    return byName ? { space, tab: byName } : null;
+  }
+
+  isShown() {
+    const info = this.previewTab();
+    return Boolean(info && info.space.active && info.tab.active);
+  }
+
   chosen() { return this.entries.find((e) => e.id === this.pick) ?? null; }
 
   choose(e, cx) {
     this.pick = e?.id ?? null;
     if (!e) return;
     if (e.kind === "md") this.loadDoc(e, cx);
-    else if (e.kind === "image" && !this.made[e.path]) cx.spawn(async (cx) => {
-      try { this.made[e.path] = (await script(["add", e.path]))[0]; } catch (err) { this.made[e.path] = { kind: "error", error: String(err?.message ?? err) }; }
+    else if (e.kind === "image" && this.made[e.path]?.entryId !== e.id) cx.spawn(async (cx) => {
+      try { this.made[e.path] = { ...(await script(["add", e.path]))[0], entryId: e.id }; }
+      catch (err) { this.made[e.path] = { kind: "error", error: String(err?.message ?? err), entryId: e.id }; }
       cx.notify();
     });
   }
@@ -164,17 +233,28 @@ export default class Viewer extends View {
 
   // The person looked: everything on the list is seen, and the tab is "Preview" again.
   looked(cx) {
-    const top = this.entries[0]?.id;
-    if (!top || top === this.lastSeen || this.marking) return;
+    if (!this.loaded || this.marking || !this.isShown()) return;
+    const top = toBigInt(this.maxId) > toBigInt(this.entries[0]?.id) ? this.maxId : (this.entries[0]?.id ?? this.lastSeen);
+    const info = this.previewTab();
+    const needsSeen = toBigInt(top) > toBigInt(this.lastSeen);
+    const needsRename = Boolean(info?.tab && info.tab.name !== "Preview");
+    if (!needsSeen && !needsRename) return;
     this.marking = true;
-    this.lastSeen = top;
+    if (needsSeen) this.lastSeen = top;
     const dir = `${appHome()}/data/scribble/previews`, sp = props().space;
+    const tabId = info?.tab?.id || this.tabId;
     cx.spawn(async (cx) => {
-      await fs.writeFile(`${dir}/${sp}.seen`, top).catch(() => {});
-      const tab = (await readTextFile(`${dir}/${sp}.tab`).catch(() => "")).trim();
-      if (tab) run("tab.rename", { id: tab, name: "Preview" });
-      this.marking = false;
-      cx.notify();
+      try {
+        if (needsSeen) {
+          await fs.writeFile(`${dir}/${sp}.seen`, top).catch(() => {});
+          this.diskSeen = top;
+        }
+        const tab = tabId || ((await readTextFile(`${dir}/${sp}.tab`).catch(() => null)) ?? "").trim();
+        if (tab) run("tab.rename", { id: tab, name: "Preview" });
+      } finally {
+        this.marking = false;
+        cx.notify();
+      }
     });
   }
 
@@ -252,7 +332,7 @@ export default class Viewer extends View {
   }
 
   previewList(t) {
-    const fresh = (e) => BigInt(e.id) > BigInt(this.lastSeen || "0");
+    const fresh = (e) => isPreviewable(e) && toBigInt(e.id) > toBigInt(this.lastSeen);
     const when = (e) => { const s = (Date.now() - e.t) / 1000; return s < 90 ? "now" : s < 5400 ? `${Math.round(s / 60)}m` : s < 129600 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`; };
     const TAG = { image: ["IMG", "#5aa9ff"], md: ["MD", "#4cd08a"], file: ["FILE", "#b48cff"] };
     const row = (e) => {
@@ -327,9 +407,23 @@ export default class Viewer extends View {
     return v_flex().flex_1().min_w(0).h_full().child(head).child(body);
   }
 
-  previewsView(t) {
+  previewsView(t, cx) {
+    const shown = this.isShown();
+    if (shown && !checking()) {
+      const newlyShown = !this.wasShown;
+      this.wasShown = true;
+      if (this.loaded) {
+        this.looked(cx);
+        if (newlyShown) cx.spawn(async (cx) => { if (await this.readPreviews(cx, true).catch(() => false)) cx.notify(); });
+      } else {
+        this.pendingLook = true;
+      }
+    } else if (!shown) {
+      this.wasShown = false;
+    }
     return h_flex().id("previews").size_full().bg(t.background).text_color(t.foreground)
       .on_mouse_move((_e, cx) => this.looked(cx))
+      .on_mouse_down("left", (_e, cx) => this.looked(cx))
       .child(this.previewList(t)).child(this.previewPane(t));
   }
 
@@ -390,6 +484,7 @@ export default class Viewer extends View {
     // The panels this bar opens: Images (the tray), and any others the layout names in
     // props.buttons [{ child, label, icon, width }], each a child of the `panel-body` stack.
     this.bar = props()?.buttons ?? [{ child: "view", label: "Images", icon: props()?.icon ?? "mods/scribble/image.svg", width: 184 }];
+    if (checking()) return;
     const panels = shared("workspace.panels") ?? ["files", "changes"];
     const more = this.bar.map((b) => b.child).filter((c) => !panels.includes(c));
     if (more.length) setShared("workspace.panels", [...panels, ...more]);   // the tab bar restores them per space
@@ -406,15 +501,37 @@ export default class Viewer extends View {
     cx.spawn(async (cx) => {
       await fs.mkdir(INBOX(), { recursive: true }).catch(() => {});
       const count = async () => {
-        const text = await readTextFile(QUEUE()).catch(() => ""), taken = BigInt(shared("scribble.taken") ?? "0"), n = {};
+        const text = (await readTextFile(QUEUE()).catch(() => null)) ?? "", taken = toBigInt(shared("scribble.taken") ?? "0"), n = {};
         for (const line of text.split("\n")) {
-          try { const m = JSON.parse(line); if (m?.id && BigInt(m.id) > taken && m.space) n[m.space] = (n[m.space] ?? 0) + 1; } catch { /* not a line */ }
+          try { const m = JSON.parse(line); if (m?.id && toBigInt(m.id) > taken && m.space) n[m.space] = (n[m.space] ?? 0) + 1; } catch { /* not a line */ }
         }
         if (JSON.stringify(n) !== JSON.stringify(shared("scribble.pending") ?? {})) setShared("scribble.pending", n);
       };
       await count();
       for (;;) { await watchFolder(INBOX()); await count(); cx.notify(); }
     });
+    // Keep Preview tab names in sync with existing unseen previewable files (read-only on .jsonl).
+    const previewsDir = `${appHome()}/data/scribble/previews`;
+    const syncPreviews = async () => {
+      const counts = await script(["counts"]).catch(() => null);
+      if (!counts || typeof counts !== "object") return;
+      for (const s of spaces()) {
+        const info = counts[s.id];
+        if (!info?.tab) continue;
+        const t = s.tabs.find((x) => x.id === info.tab);
+        if (!t) continue;
+        if (s.active && t.active) continue;   // the shown Preview tab manages itself
+        if (t.name !== "Preview" && !t.name.startsWith("Preview · ")) continue;
+        const want = info.fresh > 0 ? `Preview · ${info.fresh} new` : "Preview";
+        if (t.name !== want) run("tab.rename", { id: t.id, name: want });
+      }
+    };
+    cx.spawn(async () => {
+      await fs.mkdir(previewsDir, { recursive: true }).catch(() => {});
+      await syncPreviews();
+      for (;;) { await watchFolder(previewsDir); await syncPreviews(); }
+    });
+    cx.timer.every(30000, (cx) => cx.spawn(async () => { await syncPreviews(); }));
   }
 
   // The panel child that shows now, or null when the panel is closed.
@@ -786,10 +903,10 @@ export default class Viewer extends View {
         .child(TextView.markdown("md", String(this.text ?? " ")).selectable(true)));
   }
 
-  render() {
+  render(cx) {
     const t = theme();
     if (this.button) return this.bar_button(t);
-    if (this.previews) return this.previewsView(t);
+    if (this.previews) return this.previewsView(t, cx);
     if (this.reader) return v_flex().id("reader").size_full().bg(t.background).text_color(t.foreground)
       .child(h_flex().flex_none().px(12).py(6).gap(6).items_center().border_b(1).border_color(t.border)
         .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(this.it.path))
